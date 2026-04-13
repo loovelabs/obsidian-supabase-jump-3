@@ -1,6 +1,6 @@
 {
 	"name": "supabase-jump",
-	"version": "1.1.5",
+	"version": "1.2.0-loove.1",
 	"description": "Obsidian plugin to sync your vault with Supabase",
 	"main": "main.js",
 	"type": "module",
@@ -22,7 +22,7 @@
 	"license": "0-BSD",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/brianstm/obsidian-supabase-jump.git"
+		"url": "https://github.com/loovelabs/obsidian-supabase-jump-3.git"
 	},
 	"bugs": {
 		"url": "https://github.com/brianstm/obsidian-supabase-jump/issues"
