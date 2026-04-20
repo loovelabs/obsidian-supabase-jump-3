@@ -1,6 +1,6 @@
 import { Notice, TFile, Vault, Platform } from "obsidian";
 import { SupabaseClient } from "@supabase/supabase-js";
-import { isBinary, isExcluded, isPlatformExcluded, isSystemFile } from "./settings";
+import { isBinary, isExcluded, isPlatformExcluded, isSystemFile, isSystemVaultPath } from "./settings";
 import { parseFrontmatter } from "./frontmatter";
 import { SyncStatus } from "./supabase";
 
@@ -61,6 +61,7 @@ export interface SyncHost {
 	readonly vault: Vault;
 	readonly settings: {
 		vaultId: string;
+		systemVaultId: string;
 		syncOnStartup: boolean;
 		syncConfigFolder: boolean;
 		syncIntervalMinutes: number;
@@ -124,6 +125,15 @@ export class SyncEngine {
 		if (row.platform === "all") return true;
 		const currentPlatform = Platform.isMobile ? "mobile" : "desktop";
 		return row.platform === currentPlatform;
+	}
+
+	/**
+	 * Returns true if the given row belongs to the system vault
+	 * (translation-layer-generated notes).
+	 */
+	private isSystemRow(row: VaultFileRow): boolean {
+		const sysId = this.host.settings.systemVaultId;
+		return !!sysId && row.vault_id === sysId;
 	}
 
 	private async listAdapterFiles(folderPath: string): Promise<string[]> {
@@ -247,6 +257,9 @@ export class SyncEngine {
 	}
 
 	async pushFile(file: TFile): Promise<void> {
+		// Never push system vault files back — they are read-only projections
+		if (isSystemVaultPath(file.path)) return;
+
 		const { vaultId } = this.host.settings;
 		const userId = await this.getUserId();
 		const rowId = toRowId(vaultId, file.path);
@@ -432,6 +445,9 @@ export class SyncEngine {
 	}
 
 	async deleteRemoteFile(path: string): Promise<void> {
+		// Never delete system vault files — they are owned by the translation layer
+		if (isSystemVaultPath(path)) return;
+
 		try {
 			const { vaultId } = this.host.settings;
 			const rowId = toRowId(vaultId, path);
@@ -477,6 +493,44 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Fetch system vault rows (translation-layer-generated notes) and
+	 * pull them into the local vault. These are read-only on the client side.
+	 */
+	private async fetchSystemVaultRows(errors: string[]): Promise<void> {
+		const { systemVaultId } = this.host.settings;
+		if (!systemVaultId) return;
+
+		const { data, error } = await this.client
+			.from(DB_TABLE)
+			.select("*")
+			.eq("vault_id", systemVaultId)
+			.eq("deleted", false);
+
+		if (error) {
+			console.warn(
+				`Supabase jump: failed to fetch system vault - ${error.message}`,
+			);
+			return;
+		}
+
+		const systemRows = (data as VaultFileRow[]) ?? [];
+
+		for (const row of systemRows) {
+			if (this.shouldSkip(row.path)) continue;
+			if (!this.shouldPull(row)) continue;
+
+			const localMtime = await this.getLocalMtime(row.path);
+			if (row.mtime > localMtime) {
+				try {
+					await this.pullFile(row);
+				} catch {
+					errors.push(row.path);
+				}
+			}
+		}
+	}
+
 	async fetchOnly(): Promise<void> {
 		const { vaultId } = this.host.settings;
 
@@ -515,6 +569,9 @@ export class SyncEngine {
 					}
 				}
 			}
+
+			// Also fetch system vault notes
+			await this.fetchSystemVaultRows(errors);
 
 			this.host.settings.lastSyncTime = Date.now();
 			await this.host.saveSettings();
@@ -563,7 +620,9 @@ export class SyncEngine {
 
 			const localFiles = this.host.vault
 				.getFiles()
-				.filter((f) => !this.shouldSkip(f.path));
+				.filter((f) => !this.shouldSkip(f.path))
+				// Never push system vault paths (they're read-only projections)
+				.filter((f) => !isSystemVaultPath(f.path));
 
 			for (const file of localFiles) {
 				const remote = remoteMap.get(file.path);
@@ -616,6 +675,9 @@ export class SyncEngine {
 				}
 			}
 
+			// Pull system vault notes (read-only, server always wins)
+			await this.fetchSystemVaultRows(errors);
+
 			this.host.settings.lastSyncTime = Date.now();
 			await this.host.saveSettings();
 
@@ -635,9 +697,10 @@ export class SyncEngine {
 	}
 
 	startRealtimeListener(): void {
-		const { vaultId } = this.host.settings;
+		const { vaultId, systemVaultId } = this.host.settings;
 		if (!vaultId) return;
 
+		// Subscribe to user's own vault
 		this.client
 			.channel(`vault-${vaultId}`)
 			.on<VaultFileRow>(
@@ -681,6 +744,30 @@ export class SyncEngine {
 					this.host.setStatus("synced");
 				}
 			});
+
+		// Also subscribe to system vault if configured
+		if (systemVaultId) {
+			this.client
+				.channel(`vault-system-${systemVaultId}`)
+				.on<VaultFileRow>(
+					"postgres_changes",
+					{
+						event: "*",
+						schema: "public",
+						table: DB_TABLE,
+						filter: `vault_id=eq.${systemVaultId}`,
+					},
+					(payload) => {
+						this.handleSystemRealtimeEvent(payload).catch((err) => {
+							console.error(
+								"Supabase jump: System vault realtime handler error",
+								err,
+							);
+						});
+					},
+				)
+				.subscribe();
+		}
 	}
 
 	private async handleRealtimeEvent(payload: {
@@ -710,6 +797,40 @@ export class SyncEngine {
 
 		const localMtime = await this.getLocalMtime(row.path);
 		if (row.mtime > localMtime && this.shouldPull(row)) {
+			await this.pullFile(row);
+		}
+	}
+
+	/**
+	 * Handle realtime events for system vault notes.
+	 * System vault notes are always pulled (server is authoritative)
+	 * and never deleted locally when deleted on server (soft-delete handled
+	 * by translation layer).
+	 */
+	private async handleSystemRealtimeEvent(payload: {
+		eventType: string;
+		new: Partial<VaultFileRow>;
+		old: Partial<VaultFileRow>;
+	}): Promise<void> {
+		const { eventType, new: newRow, old: oldRow } = payload;
+
+		if (eventType === "DELETE") {
+			const path = oldRow.path;
+			if (path) await this.deleteLocalFile(path);
+			return;
+		}
+
+		const row = newRow as VaultFileRow;
+		if (!row?.path) return;
+
+		if (row.deleted) {
+			await this.deleteLocalFile(row.path);
+			return;
+		}
+
+		// System vault: server is always authoritative — always pull
+		const localMtime = await this.getLocalMtime(row.path);
+		if (row.mtime > localMtime) {
 			await this.pullFile(row);
 		}
 	}
@@ -791,6 +912,9 @@ export class SyncEngine {
 
 	queueChange(path: string, type: "push" | "delete"): void {
 		if (this.shouldSkip(path) || this.ignorePaths.has(path)) return;
+
+		// Don't queue changes for system vault paths — they're read-only
+		if (isSystemVaultPath(path)) return;
 
 		this.changeQueue.set(path, type);
 

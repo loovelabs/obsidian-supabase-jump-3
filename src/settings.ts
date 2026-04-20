@@ -14,6 +14,7 @@ export interface SupaBaseJumpSettings {
 	email: string;
 	password: string;
 	vaultId: string;
+	systemVaultId: string;
 	syncOnStartup: boolean;
 	syncConfigFolder: boolean;
 	syncIntervalMinutes: number;
@@ -29,6 +30,7 @@ export const DEFAULT_SETTINGS: SupaBaseJumpSettings = {
 	email: "",
 	password: "",
 	vaultId: "",
+	systemVaultId: "",
 	syncOnStartup: false,
 	syncConfigFolder: true,
 	syncIntervalMinutes: 5,
@@ -101,6 +103,11 @@ export function isPlatformExcluded(
 		const prefix = folder.replace(/\/$/, ""); // strip trailing slash
 		return filePath === prefix || filePath.startsWith(prefix + "/");
 	});
+}
+
+/** Returns true if the given path belongs to a system-generated vault note. */
+export function isSystemVaultPath(path: string): boolean {
+	return path.startsWith("loove/");
 }
 
 const SETUP_SQL = `-- vault_files table
@@ -318,6 +325,23 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 						this.plugin.settings.vaultId = id;
 						await this.plugin.saveSettings();
 						new Notice("Supabase jump: vault ID generated");
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("System vault ID")
+			.setDesc(
+				"ID of the system-generated vault (e.g. 'loove-system'). " +
+				"Notes from this vault are synced read-only alongside your own notes. " +
+				"Leave empty to disable system vault sync.",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("loove-system")
+					.setValue(this.plugin.settings.systemVaultId)
+					.onChange(async (value) => {
+						this.plugin.settings.systemVaultId = value.trim();
+						await this.plugin.saveSettings();
 					}),
 			);
 
